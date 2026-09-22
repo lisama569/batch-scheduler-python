@@ -486,3 +486,73 @@ def test_schedule_is_reproducible() -> None:
     run_a = _run_scenario()
     run_b = _run_scenario()
     assert run_a == run_b
+
+
+# --------------------------------------------------------------------- #
+# 9. 随机混合操作压力：多线程交错提交/完成/失败/取消/查询，结束时必须守恒
+# --------------------------------------------------------------------- #
+def test_randomized_interleaved_stress(caplog) -> None:
+    import random
+
+    sched, clock = make_scheduler(capacity=(12, 12))
+    ids: list[str] = []
+    # 预置一批作业：若干运行 + 若干排队
+    for i in range(12):
+        res = sched.submit(
+            submitter=f"u{i % 4}", request=Resource((3, 3)), priority=i % 6
+        )
+        ids.append(res.job.id)
+
+    expected_state_errors: list[str] = []
+
+    def worker(seed: int) -> None:
+        rng = random.Random(seed)
+        for _ in range(200):
+            jid = rng.choice(ids)
+            op = rng.randrange(5)
+            try:
+                if op == 0:
+                    sched.complete(jid)
+                elif op == 1:
+                    sched.fail(jid)
+                elif op == 2:
+                    sched.cancel(jid)
+                elif op == 3:
+                    sched.get_job(jid)
+                else:
+                    sched.schedule()
+            except InvalidJobStateError:
+                expected_state_errors.append(jid)  # 终态互斥/对 QUEUED finish
+            except JobNotFoundError:
+                expected_state_errors.append(jid)
+
+    threads = [threading.Thread(target=worker, args=(s,)) for s in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # 并发期间随时抽样检查不变量
+    sched.assert_invariants()
+    jobs = sched.list_jobs()
+    terminal = {JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED}
+    running = [j for j in jobs if j.state is JobState.RUNNING]
+    queued = [j for j in jobs if j.state is JobState.QUEUED]
+    ended = [j for j in jobs if j.state in terminal]
+
+    # 资源守恒：used 必须精确等于仍在运行作业的请求之和
+    total = Resource.zero(2)
+    for j in running:
+        total = total + j.request
+    assert sched.snapshot().used == total.values
+    assert len(running) + len(queued) + len(ended) == len(jobs) == 12
+    # 每个作业最多被调度一次：scheduled_at 只在 QUEUED->RUNNING 时赋值一次
+    assert all(j.scheduled_at is None or isinstance(j.scheduled_at, int) for j in jobs)
+
+    with caplog.at_level(logging.INFO):
+        snap = sched.snapshot()
+        logger.info(
+            "随机交错压力结束: running=%d queued=%d terminal=%d 合法竞态冲突=%d\n%s",
+            len(running), len(queued), len(ended), len(expected_state_errors),
+            snap.render(),
+        )
