@@ -433,12 +433,11 @@ class Scheduler:
             assert total.values == self._used.values, (
                 f"资源不守恒: 累加 {total} != 记账 {self._used}"
             )
-            # 5) submitter_used 记账一致且受配额限制
+            # 5) submitter_used 记账一致。
+            # 注意：配额只在「调度授予」时点保证；配额事后被下调时，
+            # 已运行作业不被抢占，用量可能临时高于新配额（非抢占语义）。
             for name, used in self._submitter_used.items():
                 assert used.all_non_negative(), f"{name} 用量出现负数"
                 assert per.get(name, self._zero()).values == used.values, (
                     f"提交方 {name} 记账不一致: {used} vs {per.get(name)}"
-                )
-                assert used.fits_in(self._quota_of(name)), (
-                    f"提交方 {name} 用量 {used} 超过配额 {self._quota_of(name)}"
                 )
