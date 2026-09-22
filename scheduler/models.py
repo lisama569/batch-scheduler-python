@@ -12,7 +12,7 @@ class JobState(str, enum.Enum):
     QUEUED -> RUNNING -> COMPLETED
                     \\-> FAILED
     QUEUED \\---------> CANCELLED
-    RUNNING \\--------> CANCELLED
+    RUNNING \\-------> CANCELLED
     """
 
     QUEUED = "QUEUED"
@@ -22,7 +22,7 @@ class JobState(str, enum.Enum):
     CANCELLED = "CANCELLED"
 
 
-# 终态集合与活跃态集合（模块加载后由 fill 阶段补充使用）
+# 终态集合：终态作业永远不再参与调度，也不会再次释放资源
 TERMINAL_STATES: frozenset[JobState] = frozenset(
     {JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED}
 )
@@ -32,24 +32,48 @@ TERMINAL_STATES: frozenset[JobState] = frozenset(
 class Resource:
     """多维资源向量，例如 (cpu, memory_gb, gpu)。
 
-    每个维度必须为非负整数；合法作业请求的每个维度必须 >= 1。
+    每个维度必须为非负整数；合法作业请求的每个维度必须 >= 1
+    （由调度器提交入口校验）。
     """
 
     values: tuple[int, ...]
 
     @property
     def dimensions(self) -> int:
-        raise NotImplementedError
+        return len(self.values)
+
+    @classmethod
+    def zero(cls, dimensions: int) -> "Resource":
+        return cls(tuple(0 for _ in range(dimensions)))  # type: ignore[arg-type]
+
+    def _check_dim(self, other: "Resource") -> None:
+        if self.dimensions != other.dimensions:
+            raise ValueError(
+                f"资源维度不一致: {self.dimensions} != {other.dimensions}"
+            )
 
     def fits_in(self, other: "Resource") -> bool:
         """self 的每一维都不超过 other。"""
-        raise NotImplementedError
+        self._check_dim(other)
+        return all(a <= b for a, b in zip(self.values, other.values))
+
+    def all_positive(self) -> bool:
+        """每个维度都 >= 1（作业请求的合法性要求）。"""
+        return len(self.values) > 0 and all(v >= 1 for v in self.values)
+
+    def all_non_negative(self) -> bool:
+        return len(self.values) > 0 and all(v >= 0 for v in self.values)
 
     def __add__(self, other: "Resource") -> "Resource":
-        raise NotImplementedError
+        self._check_dim(other)
+        return Resource(tuple(a + b for a, b in zip(self.values, other.values)))
 
     def __sub__(self, other: "Resource") -> "Resource":
-        raise NotImplementedError
+        self._check_dim(other)
+        return Resource(tuple(a - b for a, b in zip(self.values, other.values)))
+
+    def __str__(self) -> str:
+        return "(" + ",".join(str(v) for v in self.values) + ")"
 
 
 @dataclass
@@ -68,9 +92,17 @@ class Job:
     idempotency_key: str | None = None
 
 
+@dataclass(frozen=True)
+class SubmitResult:
+    """提交结果：duplicated=True 表示命中幂等键，返回的是既有作业。"""
+
+    job: Job
+    duplicated: bool
+
+
 @dataclass
 class SubmitterQuota:
-    """提交方可占用资源上限（每一维）。None 表示不单独限制（用默认配额）。"""
+    """提交方可占用资源上限（每一维）。limit=None 表示退回默认配额。"""
 
     submitter: str
     limit: Resource | None
@@ -105,4 +137,26 @@ class SchedulerSnapshot:
 
     def render(self) -> str:
         """渲染为人类可读的多行文本（测试日志打印用）。"""
-        raise NotImplementedError
+        lines = [
+            f"[scheduler snapshot tick={self.tick}]",
+            f"capacity : {self.capacity}",
+            f"used     : {self.used}",
+            f"available: {self.available}",
+        ]
+        if self.submitter_used:
+            lines.append("submitter usage:")
+            for name in sorted(self.submitter_used):
+                lines.append(f"  - {name}: used={self.submitter_used[name]}")
+        lines.append(f"running ({len(self.running_jobs)}): {self.running_jobs}")
+        lines.append(f"queued  ({len(self.queued_jobs)}): {self.queued_jobs}")
+        if self.decisions:
+            lines.append("decisions:")
+            for d in self.decisions:
+                verdict = "ADMIT" if d.admitted else "SKIP"
+                lines.append(
+                    f"  - [{verdict}] {d.job_id} submitter={d.submitter} "
+                    f"base_priority={d.priority} waited={d.waited} "
+                    f"effective_priority={d.effective_priority} "
+                    f"request={d.request} reason={d.reason}"
+                )
+        return "\n".join(lines)
