@@ -17,18 +17,24 @@
 ### 作业生命周期
 
 ```
-PENDING ──授予资源──▶ RUNNING ──complete()──▶ COMPLETED
-   │                    │
-   │                    ├────complete(failed=True)──▶ FAILED
-   │                    │
-   └──cancel()──▶ CANCELLED ◀──cancel()──┘
+                        依赖全部 COMPLETED
+WAITING ──────────────────────────────▶ PENDING ──授予资源──▶ RUNNING ──complete()──▶ COMPLETED
+   │  上游 FAILED/CANCELLED              │                    │
+   │  （含级联）                          │                    ├────complete(failed=True)──▶ FAILED
+   ▼                                    │                    │
+DEPENDENCY_FAILED                       └──cancel()──▶ CANCELLED ◀──cancel()──┘
+   ▲                                        ▲
+   └──────────────cancel()──────────────────┘（WAITING 也可直接取消）
 ```
 
-- `COMPLETED / FAILED / CANCELLED` 为终态。
+- `COMPLETED / FAILED / CANCELLED / DEPENDENCY_FAILED` 为终态。
+- `WAITING` 是“依赖未就绪”的等待态：**不进排队队列、不占节点容量、不占提交方
+  配额、不影响其它作业的排队顺序**；只有它依赖的作业**全部成功**后才转入
+  `PENDING` 参与调度（等待时长自原始提交时间起算，年龄加分不受影响）。
 - 每个作业**至多被调度一次**（`schedule_count ≤ 1`），资源**至多释放一次**
   （`release_count ≤ 1`）；重复完成 / 重复取消 / 对非运行作业完成都会得到
   `409 JOB_STATE_CONFLICT`，不会发生重复释放。
-- `PENDING` 取消不涉及资源（`release_count=0`）；`RUNNING` 取消释放资源。
+- `WAITING / PENDING` 取消不涉及资源（`release_count=0`）；`RUNNING` 取消释放资源。
 
 ### 调度触发与调度循环
 
@@ -66,6 +72,43 @@ PENDING ──授予资源──▶ RUNNING ──complete()──▶ COMPLETED
   必然超过任意静态优先级的后来者，因此不存在提交方被无限期饿死的可能
   （见 `test_aging_bounds_waiting_time` 的构造性证明）。
 
+## 2.5. 作业依赖
+
+提交时可通过 `depends_on: [job_id, ...]` 声明依赖**已存在**的作业（可多个；
+一个作业也可被多个作业依赖）。依赖图始终是有向无环图（DAG）。
+
+### 语义
+
+- 依赖**全部** `COMPLETED` → 下游从 `WAITING` 转入 `PENDING`，按正常规则
+  （有效优先级 + 容量 + 配额）参与调度；配额或容量暂时不够就继续排队，**不会被丢弃**。
+- 任一上游 `FAILED` / `CANCELLED` → 下游**级联**转为终态 `DEPENDENCY_FAILED`，
+  并沿依赖链继续向下传播；该作业**不会再自动运行**，查询时能看到明确的终态与
+  原因（`scheduling_note` 指明是哪个上游以何种终态导致，`history` 有完整流水）。
+- 提交时依赖已全部成功 → 直接进 `PENDING`，不经过 `WAITING`；
+  提交时已有上游终结且未成功 → 立即置为 `DEPENDENCY_FAILED`（上游已不可能再成功）。
+- 依赖传播只影响 `WAITING` 下游：能离开 `WAITING` 的下游其全部依赖已 `COMPLETED`，
+  而 `COMPLETED` 是终态不会再变，故 `PENDING / RUNNING` 作业不受上游后续事件影响。
+
+### 依赖非法写法（提交当下拒绝，原因可区分）
+
+| 情形 | 拒绝原因 (`reason`) | HTTP |
+|---|---|---|
+| 依赖的作业不存在 | `UNKNOWN_DEPENDENCY` | 422 |
+| 依赖自己 | `SELF_DEPENDENCY` | 422 |
+| 依赖构成环（直接或间接） | `DEPENDENCY_CYCLE` | 422 |
+| 依赖条目为空串等非字符串/空白 | `INVALID_REQUEST` | 422 |
+
+被拒的提交不会落库、不进队列、不占任何资源。说明：作业 id 由服务端单调生成，
+正常流程下新作业不可能出现在既有作业的依赖链中（那时它还不存在），环检测是
+对“依赖图必须是 DAG”这一不变量的防御性校验，对直接/间接环都会在提交时挡下。
+
+### 与上一版行为的兼容
+
+- 不声明 `depends_on` 的提交行为与上一版**完全一致**（直接进 `PENDING`）；
+- 原有校验、幂等、配额、优先级/老化、取消/完成语义与拒绝原因均未改变；
+- 快照新增 `waiting_jobs` 字段（依赖未就绪作业及其未完成依赖清单），
+  作业视图新增 `depends_on` 字段，均为纯增量，不影响既有字段。
+
 ## 3. 提交语义、状态与错误
 
 ### 请求校验
@@ -88,7 +131,8 @@ PENDING ──授予资源──▶ RUNNING ──complete()──▶ COMPLETED
 1. `used == Σ RUNNING 作业资源 == Σ 各提交方占用`；
 2. `used ≤ 节点容量`；各提交方占用 ≤ 各自配额；
 3. 每个作业调度次数 ≤ 1、释放次数 ≤ 1，且已调度的终态作业二者配对；
-4. 排队队列中不残留非 `PENDING` 作业。
+4. 排队队列中不残留非 `PENDING` 作业；
+5. `WAITING / DEPENDENCY_FAILED` 作业调度与释放次数均为 0（依赖等待不耗资源）。
 
 ### 可解释性
 
@@ -118,9 +162,12 @@ PENDING ──授予资源──▶ RUNNING ──complete()──▶ COMPLETED
   "submitter": "team-a",
   "priority": 5,
   "resources": {"cpu": 4, "memory_mb": 8192, "gpu": 1},
-  "duration_ms": 30000
+  "duration_ms": 30000,
+  "depends_on": ["job-000001", "job-000002"]
 }
 ```
+
+`depends_on` 可省略（无依赖，行为同上一版）。
 
 ## 5. 代码结构
 
@@ -134,6 +181,7 @@ batch_scheduler/
 tests/
   conftest.py                 # 可推进时钟夹具、守恒不变量断言、快照日志打印
   test_scheduler.py           # 校验/拒绝原因/优先级/老化/配额/取消完成/反饿死
+  test_dependencies.py        # 依赖：就绪/放行/失败取消传播/非法拒绝/并发交错/确定性
   test_concurrency.py         # 并发提交、并发幂等、取消与完成竞争、交错守恒
   test_api.py                 # HTTP 端到端
 ```
@@ -149,6 +197,7 @@ uv sync
 # 运行全部单测（-s 可看到“调度快照 + 判定依据”日志）
 uv run pytest -q
 uv run pytest -q -s                       # 打印调度快照与判定依据
+uv run pytest tests/test_dependencies.py -q -s   # 依赖能力：放行/传播/拒绝的判定日志
 uv run pytest tests/test_concurrency.py   # 只跑并发场景
 
 # 启动服务

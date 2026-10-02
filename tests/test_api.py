@@ -132,3 +132,59 @@ def test_manual_tick_endpoint_returns_decisions(client: TestClient):
     reasons = {d["job_id"]: d["reason"] for d in r.json()["decisions"]}
     assert any("容量" in reason for reason in reasons.values())
     print("[HTTP] 二次 tick 判定:", r.json()["decisions"])
+
+
+# ---------- 作业依赖（HTTP 端到端） ----------
+
+def test_dependency_flow_over_http(client: TestClient):
+    up = client.post("/jobs", json=_body("up", cpu=2)).json()
+    body = _body("down", cpu=2)
+    body["depends_on"] = [up["id"]]
+    r = client.post("/jobs", json=body)
+    assert r.status_code == 201, r.text
+    down = r.json()
+    assert down["state"] == "WAITING"
+    assert down["depends_on"] == [up["id"]]
+
+    # 快照里能看到等待中的作业及其未完成依赖
+    snap = client.get("/scheduler/snapshot").json()
+    assert [w["job_id"] for w in snap["waiting_jobs"]] == [down["id"]]
+    assert snap["waiting_jobs"][0]["unfinished_dependencies"] == [up["id"]]
+
+    # 上游成功后下游放行并运行
+    client.post(f"/jobs/{up['id']}/complete")
+    final = client.get(f"/jobs/{down['id']}").json()
+    assert final["state"] == "RUNNING"
+    print(f"HTTP 依赖放行: {down['id']} -> {final['state']} note={final['scheduling_note']}")
+
+
+def test_dependency_failure_propagates_over_http(client: TestClient):
+    up = client.post("/jobs", json=_body("up2", cpu=2)).json()
+    body = _body("down2", cpu=2)
+    body["depends_on"] = [up["id"]]
+    down = client.post("/jobs", json=body).json()
+
+    client.post(f"/jobs/{up['id']}/complete?failed=true")
+    final = client.get(f"/jobs/{down['id']}").json()
+    assert final["state"] == "DEPENDENCY_FAILED"
+    assert up["id"] in final["scheduling_note"]
+    print(f"HTTP 失败传播: {down['id']} -> {final['state']} note={final['scheduling_note']}")
+
+
+def test_dependency_reject_reasons_over_http(client: TestClient):
+    # 依赖不存在的作业
+    body = _body("d1")
+    body["depends_on"] = ["job-999999"]
+    r = client.post("/jobs", json=body)
+    assert r.status_code == 422
+    assert r.json()["reason"] == "UNKNOWN_DEPENDENCY"
+
+    # 依赖自己（预测下一个作业 id）
+    first = client.post("/jobs", json=_body("d2", cpu=1)).json()
+    next_id = f"job-{int(first['id'].split('-')[1]) + 1:06d}"
+    body = _body("d3")
+    body["depends_on"] = [next_id]
+    r = client.post("/jobs", json=body)
+    assert r.status_code == 422
+    assert r.json()["reason"] == "SELF_DEPENDENCY"
+    print(f"HTTP 非法依赖拒绝: {r.json()['reason']} - {r.json()['message']}")

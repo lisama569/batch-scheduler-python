@@ -8,13 +8,19 @@ from typing import Any
 
 
 class JobState(str, Enum):
-    """作业生命周期状态。"""
+    """作业生命周期状态。
 
+    WAITING：已受理但依赖未就绪，不进排队队列、不占资源与配额。
+    DEPENDENCY_FAILED：上游失败/被取消导致的终态，永不自动运行。
+    """
+
+    WAITING = "WAITING"
     PENDING = "PENDING"
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+    DEPENDENCY_FAILED = "DEPENDENCY_FAILED"
 
     @property
     def is_terminal(self) -> bool:
@@ -22,7 +28,12 @@ class JobState(str, Enum):
 
 
 _TERMINAL_STATES = frozenset(
-    {JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED}
+    {
+        JobState.COMPLETED,
+        JobState.FAILED,
+        JobState.CANCELLED,
+        JobState.DEPENDENCY_FAILED,
+    }
 )
 
 
@@ -33,6 +44,9 @@ class RejectReason(str, Enum):
     EXCEEDS_NODE_CAPACITY = "EXCEEDS_NODE_CAPACITY"
     DUPLICATE_IDEMPOTENCY_KEY = "DUPLICATE_IDEMPOTENCY_KEY"
     UNKNOWN_SUBMITTER = "UNKNOWN_SUBMITTER"
+    UNKNOWN_DEPENDENCY = "UNKNOWN_DEPENDENCY"
+    SELF_DEPENDENCY = "SELF_DEPENDENCY"
+    DEPENDENCY_CYCLE = "DEPENDENCY_CYCLE"
 
 
 @dataclass(frozen=True)
@@ -87,6 +101,7 @@ class SubmitRequest:
     priority: int
     resources: Resources
     duration_ms: int = 1000
+    depends_on: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -103,6 +118,7 @@ class Job:
     scheduled_at_ns: int | None = None
     finished_at_ns: int | None = None
     duration_ms: int = 1000
+    depends_on: list[str] = field(default_factory=list)
     schedule_count: int = 0
     release_count: int = 0
     scheduling_note: str = ""
@@ -118,5 +134,6 @@ class SchedulingSnapshot:
     used: Resources | None = None
     running_jobs: list[str] = field(default_factory=list)
     pending_jobs: list[dict[str, Any]] = field(default_factory=list)
+    waiting_jobs: list[dict[str, Any]] = field(default_factory=list)
     submitter_usage: dict[str, dict[str, int]] = field(default_factory=dict)
     decisions: list[dict[str, Any]] = field(default_factory=list)

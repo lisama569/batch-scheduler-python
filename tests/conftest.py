@@ -76,12 +76,18 @@ def assert_conservation(s: Scheduler) -> None:
                 )
                 assert job.schedule_count == 1, f"{job.id} RUNNING 但调度次数={job.schedule_count}"
                 assert job.release_count == 0, f"{job.id} RUNNING 但已释放"
-            elif job.state in (JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED):
+            elif job.state in (
+                JobState.COMPLETED,
+                JobState.FAILED,
+                JobState.CANCELLED,
+                JobState.DEPENDENCY_FAILED,
+            ):
                 assert job.schedule_count <= 1, f"{job.id} 被重复调度"
                 assert job.release_count <= 1, f"{job.id} 被重复释放"
                 if job.schedule_count == 1:
                     assert job.release_count == 1, f"{job.id} 已调度但终态未释放"
-            elif job.state is JobState.PENDING:
+            elif job.state in (JobState.PENDING, JobState.WAITING):
+                # WAITING（依赖未就绪）与 PENDING 一样不得占用任何资源。
                 assert job.schedule_count == 0
                 assert job.release_count == 0
 
@@ -119,6 +125,14 @@ def log_snapshot(s: Scheduler, label: str) -> None:
             f"eff_pri={p['effective_priority']} wait={p['wait_ms']}ms "
             f"req={p['request']} note={p['note']}"
         )
+    if snap.waiting_jobs:
+        print("等待依赖(不占资源/配额, 不参与排队):")
+        for w in snap.waiting_jobs:
+            print(
+                f"  - {w['job_id']} {w['submitter']} depends_on={w['depends_on']} "
+                f"unfinished={w['unfinished_dependencies']} "
+                f"wait={w['wait_ms']}ms note={w['note']}"
+            )
     if snap.decisions:
         print("本轮判定:")
         for d in snap.decisions:

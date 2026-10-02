@@ -20,6 +20,9 @@ _REJECT_STATUS = {
     "EXCEEDS_NODE_CAPACITY": 422,
     "DUPLICATE_IDEMPOTENCY_KEY": 409,
     "UNKNOWN_SUBMITTER": 422,
+    "UNKNOWN_DEPENDENCY": 422,
+    "SELF_DEPENDENCY": 422,
+    "DEPENDENCY_CYCLE": 422,
 }
 
 
@@ -35,6 +38,7 @@ class JobSubmitIn(BaseModel):
     priority: int = Field(default=0, ge=0)
     resources: ResourcesIn
     duration_ms: int = Field(default=1000, gt=0)
+    depends_on: list[str] = Field(default_factory=list)
 
 
 def _job_to_dict(job: Job) -> dict[str, object]:
@@ -45,6 +49,7 @@ def _job_to_dict(job: Job) -> dict[str, object]:
         "priority": job.priority,
         "state": job.state.value,
         "requested": job.requested.as_dict(),
+        "depends_on": job.depends_on,
         "created_at_ns": job.created_at_ns,
         "scheduled_at_ns": job.scheduled_at_ns,
         "finished_at_ns": job.finished_at_ns,
@@ -63,6 +68,7 @@ def _snapshot_to_dict(snap) -> dict[str, object]:
         "used": snap.used.as_dict(),
         "running_jobs": snap.running_jobs,
         "pending_jobs": snap.pending_jobs,
+        "waiting_jobs": snap.waiting_jobs,
         "submitter_usage": snap.submitter_usage,
         "decisions": snap.decisions,
     }
@@ -117,6 +123,7 @@ def create_app(scheduler: Scheduler) -> FastAPI:
                 gpu=payload.resources.gpu,
             ),
             duration_ms=payload.duration_ms,
+            depends_on=payload.depends_on,
         )
         job = scheduler.submit(req)
         return _job_to_dict(job)

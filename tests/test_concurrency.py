@@ -126,10 +126,15 @@ def test_interleaved_submit_complete_conservation(scheduler):
     errors: list[Exception] = []
 
     def churn(job_id: str) -> None:
-        # 每个线程：完成一个运行中作业，再补提一个新作业
+        # 每个线程：完成一个运行中作业，再补提一个新作业。
+        # 补提作业的提交方与被完成的作业相同：释放的是哪个提交方的配额，
+        # 就由同提交方的新作业候选回填，保证空出的槽位一定能被重新授予。
+        # （此前用 hash(job_id) % 3 伪随机选提交方，但 str.hash 随
+        # PYTHONHASHSEED 随机化，偶发把过多新作业分到配额已饱和的
+        # team-c，导致空槽无候选可补、断言 16 个运行中作业失败。）
         try:
+            submitter = scheduler.get_job(job_id).submitter
             scheduler.complete(job_id)
-            submitter = ("team-a", "team-b", "team-c")[hash(job_id) % 3]
             tag = f"new-{job_id}"
             scheduler.submit(
                 SubmitRequest(tag, submitter, 2, Resources(cpu=1), 1000)
