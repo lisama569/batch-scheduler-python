@@ -132,3 +132,54 @@ def test_manual_tick_endpoint_returns_decisions(client: TestClient):
     reasons = {d["job_id"]: d["reason"] for d in r.json()["decisions"]}
     assert any("容量" in reason for reason in reasons.values())
     print("[HTTP] 二次 tick 判定:", r.json()["decisions"])
+
+
+def test_dependency_flow_over_http(client: TestClient):
+    # 上游提交即运行
+    up = client.post("/jobs", json=_body("up", cpu=2)).json()
+    assert up["state"] == "RUNNING"
+
+    # 下游声明依赖 -> BLOCKED，不占资源
+    body = _body("down", cpu=1)
+    body["depends_on"] = [up["id"]]
+    down = client.post("/jobs", json=body).json()
+    assert down["state"] == "BLOCKED"
+    assert down["depends_on"] == [up["id"]]
+    snap = client.get("/scheduler/snapshot").json()
+    assert snap["used"] == {"cpu": 2, "memory_mb": 0, "gpu": 0}
+    assert [b["job_id"] for b in snap["blocked_jobs"]] == [down["id"]]
+    print("\n[HTTP] 依赖未就绪快照:", snap["blocked_jobs"])
+
+    # 上游成功 -> 下游放行
+    client.post(f"/jobs/{up['id']}/complete")
+    r = client.get(f"/jobs/{down['id']}")
+    assert r.json()["state"] == "RUNNING"
+
+    # 上游失败 -> 下游 DEPENDENCY_FAILED 终态且可解释
+    up2 = client.post("/jobs", json=_body("up2", cpu=1)).json()
+    body = _body("down2", cpu=1)
+    body["depends_on"] = [up2["id"]]
+    down2 = client.post("/jobs", json=body).json()
+    assert down2["state"] == "BLOCKED"
+    client.post(f"/jobs/{up2['id']}/complete?failed=true")
+    r = client.get(f"/jobs/{down2['id']}").json()
+    assert r["state"] == "DEPENDENCY_FAILED"
+    assert up2["id"] in r["scheduling_note"]
+    print("[HTTP] 失败传播结果:", r["state"], r["scheduling_note"])
+
+
+def test_dependency_rejections_over_http(client: TestClient):
+    # 未知依赖
+    body = _body("bad-dep", cpu=1)
+    body["depends_on"] = ["job-999999"]
+    r = client.post("/jobs", json=body)
+    assert r.status_code == 422
+    assert r.json()["reason"] == "UNKNOWN_DEPENDENCY"
+
+    # 自依赖（首个作业 ID 必为 job-000001）
+    body = _body("self-dep", cpu=1)
+    body["depends_on"] = ["job-000001"]
+    r = client.post("/jobs", json=body)
+    assert r.status_code == 422
+    assert r.json()["reason"] == "SELF_DEPENDENCY"
+    print("\n[HTTP] 依赖拒绝:", r.json())

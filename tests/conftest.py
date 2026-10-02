@@ -63,7 +63,8 @@ def assert_conservation(s: Scheduler) -> None:
     2. used 不超过节点容量；各提交方用量不超过配额；
     3. 每个作业至多调度一次、至多释放一次；
        RUNNING 作业 schedule_count==1/release_count==0，
-       终态（非 PENDING 取消）schedule/release 配对。
+       终态（非 PENDING/BLOCKED 取消、非 DEPENDENCY_FAILED）schedule/release 配对；
+    4. BLOCKED 与 DEPENDENCY_FAILED 作业从不占用资源（schedule/release 均为 0）。
     """
     with s._lock:  # noqa: SLF001 - 测试内直接校验内部记账
         sum_running = Resources()
@@ -84,6 +85,17 @@ def assert_conservation(s: Scheduler) -> None:
             elif job.state is JobState.PENDING:
                 assert job.schedule_count == 0
                 assert job.release_count == 0
+            elif job.state is JobState.BLOCKED:
+                # 等待依赖：不占资源、不占配额、不在调度队列
+                assert job.schedule_count == 0, f"{job.id} BLOCKED 却被调度过"
+                assert job.release_count == 0
+                assert job.depends_on, f"{job.id} BLOCKED 但没有依赖"
+                assert job.id not in s._pending, f"{job.id} BLOCKED 却出现在调度队列"
+            elif job.state is JobState.DEPENDENCY_FAILED:
+                # 依赖失败终态：从未占用资源
+                assert job.schedule_count == 0, f"{job.id} DEPENDENCY_FAILED 却被调度过"
+                assert job.release_count == 0
+                assert job.id not in s._pending, f"{job.id} 终态却出现在调度队列"
 
         assert sum_running == s._used, (
             f"used={s._used.as_dict()} 与 RUNNING 求和 {sum_running.as_dict()} 不一致"
@@ -119,6 +131,13 @@ def log_snapshot(s: Scheduler, label: str) -> None:
             f"eff_pri={p['effective_priority']} wait={p['wait_ms']}ms "
             f"req={p['request']} note={p['note']}"
         )
+    if snap.blocked_jobs:
+        print("等待依赖(BLOCKED, 不占资源/配额):")
+        for b in snap.blocked_jobs:
+            print(
+                f"  - {b['job_id']} {b['submitter']} depends_on={b['depends_on']} "
+                f"waiting_for={b['waiting_for']} wait={b['wait_ms']}ms note={b['note']}"
+            )
     if snap.decisions:
         print("本轮判定:")
         for d in snap.decisions:

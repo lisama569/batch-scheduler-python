@@ -11,10 +11,13 @@ class JobState(str, Enum):
     """作业生命周期状态。"""
 
     PENDING = "PENDING"
+    BLOCKED = "BLOCKED"  # 依赖未就绪：不占资源、不占配额、不进调度队列
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+    # 终态：某个（传递）上游失败或被取消，本作业永不再被调度
+    DEPENDENCY_FAILED = "DEPENDENCY_FAILED"
 
     @property
     def is_terminal(self) -> bool:
@@ -22,7 +25,12 @@ class JobState(str, Enum):
 
 
 _TERMINAL_STATES = frozenset(
-    {JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED}
+    {
+        JobState.COMPLETED,
+        JobState.FAILED,
+        JobState.CANCELLED,
+        JobState.DEPENDENCY_FAILED,
+    }
 )
 
 
@@ -33,6 +41,9 @@ class RejectReason(str, Enum):
     EXCEEDS_NODE_CAPACITY = "EXCEEDS_NODE_CAPACITY"
     DUPLICATE_IDEMPOTENCY_KEY = "DUPLICATE_IDEMPOTENCY_KEY"
     UNKNOWN_SUBMITTER = "UNKNOWN_SUBMITTER"
+    UNKNOWN_DEPENDENCY = "UNKNOWN_DEPENDENCY"  # 依赖了不存在的作业
+    SELF_DEPENDENCY = "SELF_DEPENDENCY"  # 依赖自己
+    DEPENDENCY_CYCLE = "DEPENDENCY_CYCLE"  # 依赖构成环（直接或间接）
 
 
 @dataclass(frozen=True)
@@ -87,6 +98,7 @@ class SubmitRequest:
     priority: int
     resources: Resources
     duration_ms: int = 1000
+    depends_on: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -103,6 +115,7 @@ class Job:
     scheduled_at_ns: int | None = None
     finished_at_ns: int | None = None
     duration_ms: int = 1000
+    depends_on: list[str] = field(default_factory=list)
     schedule_count: int = 0
     release_count: int = 0
     scheduling_note: str = ""
@@ -118,5 +131,6 @@ class SchedulingSnapshot:
     used: Resources | None = None
     running_jobs: list[str] = field(default_factory=list)
     pending_jobs: list[dict[str, Any]] = field(default_factory=list)
+    blocked_jobs: list[dict[str, Any]] = field(default_factory=list)
     submitter_usage: dict[str, dict[str, int]] = field(default_factory=dict)
     decisions: list[dict[str, Any]] = field(default_factory=list)
