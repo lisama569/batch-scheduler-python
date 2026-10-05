@@ -100,7 +100,9 @@
 ### 与上一版行为的兼容范围
 
 - 不声明 `depends_on` 的提交走**完全相同的代码路径**（提交即入队、
-  同样的准入判定与排队顺序），上一版全部用例不修改即通过。
+  同样的准入判定与排队顺序）。上一版的用例作为回归测试**原样保留**在
+  `tests/test_scheduler.py / test_concurrency.py / test_api.py` 中，
+  随整套单测一起运行（验证方式与可复现前提见第 7、9 节）。
 - 既有状态（`PENDING/RUNNING/COMPLETED/FAILED/CANCELLED`）的语义、
   `schedule_count/release_count` 记账规则、幂等键行为、全部既有拒绝原因
   与 HTTP 状态码映射均不变。
@@ -193,7 +195,8 @@ tests/
   conftest.py                 # 可推进时钟夹具、守恒不变量断言、快照日志打印
   test_scheduler.py           # 校验/拒绝原因/优先级/老化/配额/取消完成/反饿死
   test_dependencies.py        # 依赖：阻塞/放行/失败与取消传播/非法拒绝/并发交错/可复现
-  test_concurrency.py         # 并发提交、并发幂等、取消与完成竞争、交错守恒
+  test_concurrency.py         # 并发提交、并发幂等、取消与完成竞争、交错守恒、
+                              # 交错结论跨轮次可复现、容量/额度不足边界（排队不丢弃）
   test_api.py                 # HTTP 端到端（含依赖流程与依赖拒绝）
 ```
 
@@ -205,11 +208,24 @@ tests/
 # 安装依赖
 uv sync
 
-# 运行全部单测（-s 可看到“调度快照 + 判定依据”日志）
+# 运行全部单测
 uv run pytest -q
-uv run pytest -q -s                       # 打印调度快照与判定依据
-uv run pytest tests/test_dependencies.py  # 只跑依赖能力用例
-uv run pytest tests/test_concurrency.py   # 只跑并发场景
+
+# 逐条列出覆盖了哪些业务用例、各用例是否通过
+uv run pytest -v
+
+# 再叠加 -s：打印每个场景的“调度快照 + 判定依据 + 终态摘要”日志
+uv run pytest -v -s
+
+# 只跑某一类场景
+uv run pytest tests/test_dependencies.py  # 依赖能力用例
+uv run pytest tests/test_concurrency.py   # 并发交错与容量/额度边界
+
+# 可复现性验证（与本次结论的得出方式一致）：
+# 1) 同一进程内反复跑整套单测，必须每次都全过
+for i in $(seq 1 50); do uv run pytest -q -p no:cacheprovider | tail -1; done | sort | uniq -c
+# 2) 换进程、换哈希种子跑，结论必须一致（测试不依赖 PYTHONHASHSEED）
+for seed in 0 1 42 random; do PYTHONHASHSEED=$seed uv run pytest -q | tail -1; done
 
 # 启动服务
 uv run fastapi dev main.py
@@ -244,3 +260,39 @@ curl -s localhost:8000/scheduler/snapshot
   对相同输入序列逐位可复现；生产默认使用 `time.monotonic_ns()`。
 - 所有状态变更都在同一把可重入锁内完成记账；调度器内部授予/释放路径带有
   “超配 / 超配额 / 重复调度 / 重复释放 / 用量为负”的断言，属于不可恢复的编程错误。
+
+## 9. 并发测试的可复现性约定
+
+并发交错场景（多线程同时提交、完成、取消）的测试遵循以下约定，保证
+“同一份代码、反复跑、换进程跑，结论每次都一样”：
+
+- **断言只表达交错不变量**：凡依赖线程交错顺序才可能成立的固定结果
+  （例如“恰好 N 个在运行”），必须先给出与交错顺序无关的论证再断言。
+  调度器每次操作都以 `tick()` 收尾、`tick()` 扫描到“整轮无新授予”才停，
+  因此稳定态下“节点未满 ⇒ 每个还有排队作业的提交方配额必已用满”。
+  据此可推出终态的运行/排队计数是确定的（论证写在
+  `tests/test_concurrency.py` 的 `_CHURN_SUBMITTERS` 注释中），
+  而不是某次运行的巧合。
+- **测试代码不引入任何随机源**：不使用 `hash()`（字符串哈希随
+  `PYTHONHASHSEED` 逐进程随机化）、不使用 `random`、不依赖墙钟时间；
+  补提作业的提交方等选择一律按确定规则分配。曾经正是
+  `hash(job_id) % 3` 让补提作业在提交方间的分布随进程漂移，
+  分布偏斜时配额池填不满节点，导致“16 个在运行”的断言偶发失败、
+  且换进程结论不一致——该写法已移除并有回归覆盖。
+- **不变量逐用例校验**：每个用例结尾调用 `assert_conservation`
+  （`used == ΣRUNNING == Σ各提交方占用`、不超容量/配额、调度/释放计数配对、
+  队列无脏 id）；容量或额度暂时不足的场景断言“排队等待、不丢弃、
+  不提前判终态、释放后被接住”（见
+  `test_concurrent_quota_shortage_queues_then_fills`、
+  `test_exact_fit_boundary_grant_vs_queue`）。
+- **可复现性有专门用例兜底**：
+  `test_interleaved_churn_reproducible_across_rounds` 把同一交错混沌脚本
+  在 5 个全新调度器实例上各跑一遍（每轮线程交错都不同），
+  要求终态摘要逐位相同；`test_same_input_sequence_reproduces_same_outcome`
+  固定输入序列验证结论逐位可复现。
+
+本次兼容性结论的验证方式：整套单测（58 条，含上一版保留的回归用例）
+在同一进程内连续运行 50 次以上、并在多个 `PYTHONHASHSEED`（含 `random`）
+下分别运行，结果全部通过；本地可用第 7 节的命令复现同样的结果。
+结论可复现的前提：测试全部使用注入的假时钟、无随机源、无网络依赖；
+若改动调度规则或配额/容量配置，需重新按上述方式验证。
