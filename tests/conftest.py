@@ -117,6 +117,38 @@ def assert_conservation(s: Scheduler) -> None:
             assert s._jobs[jid].state is JobState.PENDING
 
 
+def assert_no_grantable_pending(s: Scheduler) -> None:
+    """交错不变量：调度已收敛到不动点 —— 没有任何 PENDING 作业能被立即授予。
+
+    每个仍在排队的作业必须被“节点剩余容量不足”或“提交方剩余配额不足”
+    之一挡住（可解释、不是被丢弃）。该性质不依赖并发交错顺序：
+    每次状态变更后都会同步执行一轮 tick 到不动点，因此任意操作序列
+    结束后它必然成立。
+    """
+    with s._lock:  # noqa: SLF001 - 测试内直接校验内部记账
+        node_remaining = s._capacity - s._used
+        for job in s._jobs.values():
+            if job.state is not JobState.PENDING:
+                continue
+            quota = s._quotas.get(job.submitter)
+            quota_remaining = (
+                quota - s._submitter_used.get(job.submitter, Resources())
+                if quota is not None
+                else None
+            )
+            blocked_by_quota = (
+                quota_remaining is not None
+                and not job.requested.fits_in(quota_remaining)
+            )
+            blocked_by_capacity = not job.requested.fits_in(node_remaining)
+            assert blocked_by_quota or blocked_by_capacity, (
+                f"{job.id} 仍在排队但资源与配额都足够（应已被授予）: "
+                f"req={job.requested.as_dict()} "
+                f"node_remaining={node_remaining.as_dict()} "
+                f"quota_remaining={quota_remaining.as_dict() if quota_remaining else None}"
+            )
+
+
 def log_snapshot(s: Scheduler, label: str) -> None:
     """打印调度快照与判定依据（单测日志要求）。"""
     snap = s.snapshot()

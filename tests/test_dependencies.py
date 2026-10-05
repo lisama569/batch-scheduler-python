@@ -410,5 +410,8 @@ def test_concurrent_submit_cancel_complete_interleaved(scheduler):
     pending = [j for j in deps if j.state is JobState.PENDING]
     assert len(running) == 8 and len(pending) == 2
     assert scheduler.get_job(up_cancel.id).state is JobState.CANCELLED
+    # 2 个排队下游必须被配额明确挡住（等待而非被丢弃/误判终态）
+    from .conftest import assert_no_grantable_pending
+    assert_no_grantable_pending(scheduler)
     log_snapshot(scheduler, "提交/取消/完成全部交错")
     assert_conservation(scheduler)

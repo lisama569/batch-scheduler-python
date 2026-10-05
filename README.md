@@ -100,7 +100,7 @@
 ### 与上一版行为的兼容范围
 
 - 不声明 `depends_on` 的提交走**完全相同的代码路径**（提交即入队、
-  同样的准入判定与排队顺序），上一版全部用例不修改即通过。
+  同样的准入判定与排队顺序）。
 - 既有状态（`PENDING/RUNNING/COMPLETED/FAILED/CANCELLED`）的语义、
   `schedule_count/release_count` 记账规则、幂等键行为、全部既有拒绝原因
   与 HTTP 状态码映射均不变。
@@ -108,6 +108,8 @@
   三个依赖相关拒绝原因、快照中的 `blocked_jobs` 视图。
 - 唯一可观察的行为差异：作业 ID 序号现在只被**成功落库**的提交消耗
   （上一版中被拒提交会留下序号空洞）；ID 本身仍只是不透明标识。
+
+兼容性不是“跑过一次全绿”就算数，本次的验证方式与可复现前提见第 7 节。
 
 ## 3. 配额与公平规则
 
@@ -143,7 +145,11 @@
 1. `used == Σ RUNNING 作业资源 == Σ 各提交方占用`；
 2. `used ≤ 节点容量`；各提交方占用 ≤ 各自配额；
 3. 每个作业调度次数 ≤ 1、释放次数 ≤ 1，且已调度的终态作业二者配对；
-4. 排队队列中不残留非 `PENDING` 作业。
+4. 排队队列中不残留非 `PENDING` 作业；
+5. 调度不动点：任何 `PENDING` 作业都不能被立即授予——它必然被
+   “节点剩余容量不足”或“提交方剩余配额不足”之一明确挡住
+   （`assert_no_grantable_pending`）。这条性质与并发交错顺序无关，
+   是“容量/额度暂时不够就排队等待、不丢弃、不提前判终态”的可断言形式。
 
 ### 可解释性
 
@@ -190,10 +196,10 @@ batch_scheduler/
   scheduler.py                # 核心调度器：加锁记账、tick 调度循环、老化公平、依赖传播、快照
   service.py                  # FastAPI 路由与错误码映射
 tests/
-  conftest.py                 # 可推进时钟夹具、守恒不变量断言、快照日志打印
+  conftest.py                 # 可推进时钟夹具、守恒/不动点不变量断言、快照日志打印
   test_scheduler.py           # 校验/拒绝原因/优先级/老化/配额/取消完成/反饿死
   test_dependencies.py        # 依赖：阻塞/放行/失败与取消传播/非法拒绝/并发交错/可复现
-  test_concurrency.py         # 并发提交、并发幂等、取消与完成竞争、交错守恒
+  test_concurrency.py         # 并发提交、并发幂等、取消与完成竞争、交错守恒、多轮签名可复现
   test_api.py                 # HTTP 端到端（含依赖流程与依赖拒绝）
 ```
 
@@ -211,6 +217,33 @@ uv run pytest -q -s                       # 打印调度快照与判定依据
 uv run pytest tests/test_dependencies.py  # 只跑依赖能力用例
 uv run pytest tests/test_concurrency.py   # 只跑并发场景
 
+# 可复现性验证：同一份代码反复跑、换进程跑，结论必须每次都一样
+for i in $(seq 1 20); do uv run pytest -q | tail -1; done
+for seed in 0 1 12 42 2026; do
+  PYTHONHASHSEED=$seed uv run pytest -q | tail -1
+done
+```
+
+### 结论可复现的前提
+
+- 测试**不依赖进程内随机化的任何量**：曾经 `test_concurrency.py` 用
+  `hash(job_id) % 3` 给新作业分配提交方，而 CPython 对字符串哈希按进程
+  随机化（`PYTHONHASHSEED`），导致某些进程里新作业的提交方分布使配额成为
+  瓶颈、“恰好 16 个运行”不再成立 —— 同一份代码换个进程就偶发失败。
+  现已改为确定性的按序号分配，并固定了该边界下必然成立的结论。
+- 并发用例断言的都是**在所有合法交错下必然成立的性质**：
+  资源/额度记账守恒（`assert_conservation`）、调度收敛到不动点
+  （`assert_no_grantable_pending`：每个排队作业都被容量或配额明确挡住，
+  是“等待”而不是被丢弃或被误判终态）、以及可推导的确定计数
+  （注释中给出推导）。`test_repeated_interleaved_scenario_converges_to_same_signature`
+  把同一“并发提交+完成+取消”场景连跑 20 轮，逐轮打印并比对终局签名，
+  签名只包含交错不变量，任何一轮不同都会失败。
+- 时间相关结论（优先级/老化）使用注入的假时钟，与真实时间无关。
+
+在上述前提下，本次验证记录：同一进程连跑 16 次、30 次并发文件压力跑、
+10 个不同 `PYTHONHASHSEED` 进程各跑一次，全部 56 个用例稳定通过。
+
+```bash
 # 启动服务
 uv run fastapi dev main.py
 # 或
